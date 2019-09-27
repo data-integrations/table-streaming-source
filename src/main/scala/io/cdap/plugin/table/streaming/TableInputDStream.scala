@@ -1,6 +1,6 @@
 /*
  *
- * Copyright © 2017 Cask Data, Inc.
+ * Copyright © 2017-2019 Cask Data, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License"); you may not
  * use this file except in compliance with the License. You may obtain a copy of
@@ -15,10 +15,10 @@
  * the License.
  */
 
-package co.cask.hydrator
+package io.cdap.plugin.table.streaming
 
-import co.cask.cdap.api.dataset.table.Row
-import co.cask.cdap.api.spark.JavaSparkExecutionContext
+import io.cdap.cdap.api.dataset.table.Row
+import io.cdap.cdap.api.spark.JavaSparkExecutionContext
 import org.apache.spark.rdd.RDD
 import org.apache.spark.streaming.dstream.InputDStream
 import org.apache.spark.streaming.{StreamingContext, Time}
