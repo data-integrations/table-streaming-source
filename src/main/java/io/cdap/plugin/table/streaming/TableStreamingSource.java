@@ -19,7 +19,6 @@ package io.cdap.plugin.table.streaming;
 
 import io.cdap.cdap.api.Admin;
 import io.cdap.cdap.api.annotation.Description;
-import io.cdap.cdap.api.annotation.Macro;
 import io.cdap.cdap.api.annotation.Name;
 import io.cdap.cdap.api.annotation.Plugin;
 import io.cdap.cdap.api.data.format.StructuredRecord;
@@ -29,21 +28,17 @@ import io.cdap.cdap.api.dataset.InstanceConflictException;
 import io.cdap.cdap.api.dataset.table.Row;
 import io.cdap.cdap.api.dataset.table.Table;
 import io.cdap.cdap.api.dataset.table.TableProperties;
-import io.cdap.cdap.api.plugin.PluginConfig;
 import io.cdap.cdap.api.spark.JavaSparkExecutionContext;
+import io.cdap.cdap.etl.api.FailureCollector;
 import io.cdap.cdap.etl.api.PipelineConfigurer;
 import io.cdap.cdap.etl.api.streaming.StreamingContext;
 import io.cdap.cdap.etl.api.streaming.StreamingSource;
 import io.cdap.plugin.common.RowRecordTransformer;
-import io.cdap.plugin.common.TimeParser;
 import org.apache.spark.api.java.function.Function;
 import org.apache.spark.streaming.api.java.JavaDStream;
 import org.apache.spark.streaming.api.java.JavaStreamingContext;
 import scala.Tuple2;
 import scala.reflect.ClassTag$;
-
-import java.io.IOException;
-import javax.annotation.Nullable;
 
 /**
  * A StreamingSource that returns the entire contents of a Table as each micro batch and refreshes the contents
@@ -55,45 +50,49 @@ import javax.annotation.Nullable;
   "intervals. The primary use case for this plugin is to send it to a Joiner plugin to provide lookup-like " +
   "functionality.")
 public class TableStreamingSource extends StreamingSource<StructuredRecord> {
-  private final Conf conf;
+  private final TableStreamingSourceConfig config;
 
-  public TableStreamingSource(Conf conf) {
-    this.conf = conf;
+  public TableStreamingSource(TableStreamingSourceConfig config) {
+    this.config = config;
   }
 
   @Override
   public void configurePipeline(PipelineConfigurer pipelineConfigurer) throws IllegalArgumentException {
-    conf.getRefreshInterval();
-    Schema schema = conf.getSchema();
-    if (conf.rowField != null && schema.getField(conf.rowField) == null) {
-      throw new IllegalArgumentException(String.format("rowField '%s' must be present in the schema", conf.rowField));
-    }
+    FailureCollector failureCollector = pipelineConfigurer.getStageConfigurer().getFailureCollector();
+    config.validate(failureCollector);
+    failureCollector.getOrThrowException();
+
+    Schema schema = config.getSchema();
     pipelineConfigurer.getStageConfigurer().setOutputSchema(schema);
-    if (!conf.containsMacro("name")) {
-      pipelineConfigurer.createDataset(conf.name, Table.class.getName(), getTableProperties(schema));
+    if (!config.containsMacro("name")) {
+      pipelineConfigurer.createDataset(config.getName(), Table.class.getName(), getTableProperties(schema));
     }
   }
 
   @Override
   public JavaDStream<StructuredRecord> getStream(StreamingContext streamingContext) throws Exception {
+    FailureCollector failureCollector = streamingContext.getFailureCollector();
+    config.validate(failureCollector);
+    failureCollector.getOrThrowException();
+
     JavaSparkExecutionContext cdapContext = streamingContext.getSparkExecutionContext();
     Admin admin = cdapContext.getAdmin();
-    final Schema schema = conf.getSchema();
-    if (!admin.datasetExists(conf.name)) {
+    final Schema schema = config.getSchema();
+    if (!admin.datasetExists(config.getName())) {
       try {
-        admin.createDataset(conf.name, "table", getTableProperties(schema));
+        admin.createDataset(config.getName(), "table", getTableProperties(schema));
       } catch (InstanceConflictException e) {
         // this is ok, means it was created after we checked that it didn't exist but before we were able to create it
       }
     }
-    streamingContext.registerLineage(conf.name);
+    streamingContext.registerLineage(config.getName());
 
     JavaStreamingContext jsc = streamingContext.getSparkStreamingContext();
     return JavaDStream.fromDStream(
-      new TableInputDStream(cdapContext, jsc.ssc(), conf.name,
-                            conf.getRefreshInterval(), 0L, null),
-      ClassTag$.MODULE$.<Tuple2<byte[], Row>>apply(Tuple2.class))
-      .map(new RowToRecordFunc(schema, conf.rowField));
+      new TableInputDStream(cdapContext, jsc.ssc(), config.getName(),
+                            config.getRefreshInterval(), 0L, null),
+      ClassTag$.MODULE$.apply(Tuple2.class))
+      .map(new RowToRecordFunc(schema, config.getRowField()));
   }
 
   /**
@@ -110,7 +109,7 @@ public class TableStreamingSource extends StreamingSource<StructuredRecord> {
     }
 
     @Override
-    public StructuredRecord call(Tuple2<byte[], Row> row) throws Exception {
+    public StructuredRecord call(Tuple2<byte[], Row> row) {
       if (rowRecordTransformer == null) {
         rowRecordTransformer = new RowRecordTransformer(schema, rowField);
       }
@@ -120,50 +119,10 @@ public class TableStreamingSource extends StreamingSource<StructuredRecord> {
 
   private DatasetProperties getTableProperties(Schema schema) {
     TableProperties.Builder tableProperties = TableProperties.builder().setSchema(schema);
-    if (conf.rowField != null) {
-      tableProperties.setRowFieldName(conf.rowField);
+    if (config.getRowField() != null) {
+      tableProperties.setRowFieldName(config.getRowField());
     }
     return tableProperties.build();
   }
 
-  /**
-   * Config for the plugin
-   */
-  public static class Conf extends PluginConfig {
-    @Macro
-    @Description("The name of the CDAP Table to read from.")
-    private String name;
-
-    @Description("The schema to use when reading from the table. If the table does not already exist, one will be " +
-      "created with this schema, which will allow the table to be explored through CDAP.")
-    @Nullable
-    private String schema;
-
-    @Description("Optional schema field whose value is derived from the Table row instead of from a Table column. " +
-      "The field name specified must be present in the schema, and must not be nullable.")
-    @Nullable
-    private String rowField;
-
-    @Description("How often the table contents should be refreshed. Must be specified by a number followed by " +
-      "a unit where 's', 'm', 'h', and 'd' are valid units corresponding to seconds, minutes, hours, and days. " +
-      "Defaults to '1h'.")
-    @Nullable
-    private String refreshInterval;
-
-    public Conf() {
-      refreshInterval = "1h";
-    }
-
-    public Schema getSchema() {
-      try {
-        return Schema.parseJson(schema);
-      } catch (IOException e) {
-        throw new IllegalArgumentException("Unable to parse the schema. Reason: " + e.getMessage());
-      }
-    }
-
-    public long getRefreshInterval() {
-      return TimeParser.parseDuration(refreshInterval);
-    }
-  }
 }
